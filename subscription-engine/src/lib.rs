@@ -60,6 +60,24 @@ impl SubscriptionEngine {
         Ok(())
     }
 
+    /// Activate or deactivate a merchant.
+    ///
+    /// Deactivating halts new plans, new signups and all further collection
+    /// across every plan the merchant owns, without touching existing
+    /// subscription records — subscribers can still cancel cleanly.
+    pub fn set_merchant_active(
+        env: Env,
+        merchant_id: Address,
+        active: bool,
+    ) -> Result<(), ContractError> {
+        merchant_id.require_auth();
+        let mut merchant =
+            load_merchant(&env, &merchant_id).ok_or(ContractError::MerchantNotFound)?;
+        merchant.active = active;
+        save_merchant(&env, &merchant);
+        Ok(())
+    }
+
     // ── Plan Functions ────────────────────────────────────────────────────────
 
     /// Create a subscription plan under a merchant.

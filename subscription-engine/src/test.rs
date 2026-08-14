@@ -726,3 +726,41 @@ fn records_payment_history() {
         "failed charges must be recorded, not rolled back"
     );
 }
+
+#[test]
+fn deactivating_a_merchant_stops_collection() {
+    let ctx = setup();
+    let plan_id = subscribed(&ctx);
+    ctx.client.set_merchant_active(&ctx.merchant, &false);
+    ctx.warp(INTERVAL + 1, 100);
+
+    let result = ctx.client.try_process_payment(&ctx.subscriber, &plan_id);
+    assert_eq!(result, Err(Ok(ContractError::MerchantInactive)));
+}
+
+#[test]
+fn a_deactivated_merchant_can_be_reactivated() {
+    let ctx = setup();
+    let plan_id = subscribed(&ctx);
+    ctx.client.set_merchant_active(&ctx.merchant, &false);
+    ctx.client.set_merchant_active(&ctx.merchant, &true);
+    ctx.warp(INTERVAL + 1, 100);
+
+    assert_eq!(
+        ctx.client.process_payment(&ctx.subscriber, &plan_id),
+        PaymentOutcome::Paid
+    );
+}
+
+#[test]
+fn a_subscriber_can_still_cancel_under_a_deactivated_merchant() {
+    let ctx = setup();
+    let plan_id = subscribed(&ctx);
+    ctx.client.set_merchant_active(&ctx.merchant, &false);
+
+    ctx.client.cancel_subscription(&ctx.subscriber, &plan_id);
+    assert_eq!(
+        ctx.subscription(plan_id).status,
+        SubscriptionStatus::Cancelled
+    );
+}
