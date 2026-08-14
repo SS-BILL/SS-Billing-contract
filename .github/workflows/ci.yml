@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: subscription-engine
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel, components and target.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: subscription-engine
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Build WASM
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      # A lockfile that drifts from Cargo.toml silently un-pins the
+      # dependency graph, which is how this crate ended up resolving an
+      # incompatible ed25519-dalek and failing to compile at all.
+      - name: Verify lockfile is current
+        run: cargo verify-project && git diff --exit-code Cargo.lock
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: subscription-engine-wasm
+          path: subscription-engine/target/wasm32-unknown-unknown/release/subscription_engine.wasm
