@@ -1,432 +1,214 @@
-# SS-Billing
+# SS-Billing — Subscription Engine
 
-> A production-grade, decentralized subscription billing platform built on the **Stellar Soroban** smart contract platform — a trustless, on-chain alternative to Stripe Billing.
+Soroban smart contract for recurring on-chain billing on Stellar. Merchants
+publish plans; subscribers approve a spending allowance once; a keeper collects
+each cycle without further signatures.
+
+This repository contains **only the contract**. The
+[backend](https://github.com/SS-BILL/SS-Billing-backend) and
+[frontend](https://github.com/SS-BILL/SS-Billing-frontend) live in their own
+repositories.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Stellar Network](https://img.shields.io/badge/Network-Stellar%20Soroban-7B2FBE)](https://stellar.org)
-[![Built with Rust](https://img.shields.io/badge/Contract-Rust%20%2B%20Soroban-orange)](https://soroban.stellar.org)
-[![NestJS](https://img.shields.io/badge/API-NestJS-red)](https://nestjs.com)
-[![Next.js](https://img.shields.io/badge/Frontend-Next.js%2014-black)](https://nextjs.org)
+[![Soroban SDK](https://img.shields.io/badge/soroban--sdk-21.7-orange)](https://developers.stellar.org/docs/build/smart-contracts)
+
+> **Status: testnet only.** This contract has not been audited and has not been
+> deployed to mainnet. Do not route real funds through it.
 
 ---
 
-## Overview
+## How billing works
 
-SS-Billing enables merchants to create subscription plans and collect recurring payments from subscribers — entirely enforced by a Soroban smart contract on the Stellar network. No intermediaries. No custodial risk. Every billing cycle is transparent, auditable, and immutable on-chain.
+The contract never holds funds. It moves them directly from subscriber to
+merchant treasury using the SAC allowance mechanism.
 
-**Key capabilities:**
+```
+1. Merchant   register_merchant(name, treasury)      signs
+2. Merchant   create_plan(amount, interval, ...)     signs
+3. Subscriber token.approve(spender = contract, ...) signs   <-- the one signature
+4. Subscriber subscribe(plan_id)                     signs   <-- charges cycle 1
+5. Keeper     process_payment(subscriber, plan_id)   no signature needed
+   ...repeated every interval
+```
 
-- **On-chain billing engine** — Soroban contract handles plan creation, subscriptions, payment execution, grace periods, and retry logic
-- **One-time subscriber authorization** — subscribers sign once; the contract executes all future cycles permissionlessly
-- **Automated scheduler** — NestJS backend polls due subscriptions and triggers `process_payment` on-chain
-- **Webhook delivery** — HMAC-signed event notifications for payment success/failure
-- **Analytics API** — revenue tracking and subscription metrics per merchant
-- **Freighter wallet integration** — browser-native Stellar wallet support in the frontend
+Step 5 is the point of the contract. `process_payment` is callable by anyone —
+a keeper, the merchant, a cron job, a stranger — because the funds move under
+the allowance granted in step 3, not under the caller's authority. The contract
+authorizes the `transfer_from` as itself, which Soroban permits automatically
+for sub-invocations a contract makes directly.
+
+### The allowance is not permanent
+
+Stellar allowances carry an **expiration ledger**. The accurate description of
+this model is *"sign once per approval window"*, not *"sign once, forever"*.
+When the approval lapses or its balance runs down, `process_payment` returns
+`Retrying` and the subscription drifts into `GracePeriod` and then `Failed`.
+
+Clients must surface `get_billing_allowance` and prompt for re-approval before
+the window closes. A dashboard that shows an active subscription without showing
+a lapsing allowance is showing a subscription that is about to stop paying.
 
 ---
 
-## Architecture
+## Lifecycle
 
 ```
-SS-Billing/
-├── contracts/
-│   └── subscription-engine/     # Soroban smart contract (Rust)
-│       ├── src/
-│       │   ├── lib.rs            # Contract entry points
-│       │   ├── types.rs          # Data structures
-│       │   ├── storage.rs        # Ledger storage helpers
-│       │   ├── errors.rs         # ContractError enum
-│       │   └── events.rs         # On-chain event emitters
-│       └── tests/
-├── backend/                      # NestJS API
-│   └── src/
-│       ├── modules/
-│       │   ├── billing/          # Scheduler + blockchain indexer
-│       │   ├── merchant/         # Merchant CRUD
-│       │   ├── plan/             # Plan management
-│       │   ├── subscription/     # Subscription lifecycle
-│       │   ├── analytics/        # Revenue & stats
-│       │   ├── webhook/          # HMAC-signed event delivery
-│       │   └── auth/             # JWT + Stellar signature auth
-│       ├── db/                   # TypeORM entities + data source
-│       └── config/               # App, Stellar, Redis config
-├── frontend/                     # Next.js 14 app
-│   └── src/
-│       ├── app/                  # App Router pages
-│       ├── components/           # UI components + charts
-│       ├── store/                # Zustand wallet state
-│       └── lib/                  # API client
-├── packages/
-│   ├── types/                    # Shared TypeScript types
-│   ├── sdk/                      # Contract interaction SDK
-│   ├── ui/                       # Shared React components
-│   └── config/                   # Network constants
-└── infra/
-    ├── docker/                   # Dockerfiles + docker-compose
-    └── monitoring/               # Prometheus + Grafana
+                subscribe
+                    │
+                    ▼
+              ┌──────────┐  pause    ┌────────┐
+              │  Active  │──────────▶│ Paused │
+              │          │◀──────────│        │
+              └────┬─────┘  resume   └────────┘
+                   │
+       charge fails│  ┌──────────────┐
+                   └─▶│ GracePeriod  │──┐ charge succeeds
+                      └──────┬───────┘◀─┘  (returns to Active)
+                             │
+        retries exhausted OR │
+        grace window closed  ▼
+                      ┌──────────┐
+                      │  Failed  │  terminal — resubscribe required
+                      └──────────┘
 ```
+
+`cancel_subscription` moves to `Cancelled` from any non-terminal state.
+
+**Pause does not shift the billing anchor.** A subscription paused before its
+due date and resumed after it is immediately billable for the cycle it kept
+access through.
 
 ---
 
-## How It Works
+## Contract interface
 
-```
-Subscriber                  Soroban Contract              Merchant Treasury
-    │                              │                              │
-    │──── subscribe(plan_id) ─────▶│                              │
-    │                              │──── transfer(amount) ───────▶│  (first payment)
-    │                              │                              │
-    │         [time passes — billing interval elapses]            │
-    │                              │                              │
-Scheduler ── process_payment() ──▶│                              │
-                                   │──── transfer(amount) ───────▶│  (recurring)
-                                   │                              │
-                                   │──── emit PaymentSuccess ─────▶ Webhook → Merchant
-```
+### Merchant
 
-The contract enforces all business logic: grace periods, retry limits, pause/resume state, and cancellation. The backend scheduler is a convenience layer — any actor can call `process_payment` once billing is due.
+| Function | Auth | Notes |
+|---|---|---|
+| `register_merchant(name, treasury_wallet)` | treasury | The treasury address is the merchant identity |
+| `update_treasury(merchant_id, new_treasury)` | merchant | Routes future collections elsewhere |
+| `create_plan(merchant_id, name, amount, token, interval, grace_period, retry_limit, retry_interval) -> plan_id` | merchant | |
+| `update_plan(merchant_id, plan_id, amount, interval, grace_period, retry_limit, retry_interval)` | merchant | Applies to existing subscribers on their next cycle |
+| `disable_plan(merchant_id, plan_id)` | merchant | Halts new signups **and** further collection |
 
----
+### Subscriber
 
-## Smart Contract
+| Function | Auth | Notes |
+|---|---|---|
+| `subscribe(subscriber, plan_id)` | subscriber | Charges cycle 1; fails without a sufficient allowance |
+| `pause_subscription(subscriber, plan_id)` | subscriber | |
+| `resume_subscription(subscriber, plan_id)` | subscriber | Preserves the original due date |
+| `cancel_subscription(subscriber, plan_id)` | subscriber | Terminal |
 
-### Core Data Types
+### Keeper
 
-```rust
-// types.rs
-#[contracttype]
-pub struct SubscriptionPlan {
-    pub plan_id:      u64,
-    pub merchant_id:  Address,
-    pub name:         Symbol,
-    pub amount:       i128,       // in stroops (1 XLM = 10_000_000)
-    pub token:        Address,    // any SEP-41 token
-    pub interval:     u64,        // billing interval in seconds
-    pub grace_period: u64,        // seconds after due date before retry
-    pub retry_limit:  u32,
-    pub active:       bool,
-}
+| Function | Auth | Returns |
+|---|---|---|
+| `process_payment(subscriber, plan_id)` | **none** | `Paid` \| `Retrying` \| `Failed` |
 
-#[contracttype]
-pub struct Subscriber {
-    pub subscriber:      Address,
-    pub plan_id:         u64,
-    pub next_billing_at: u64,
-    pub status:          SubscriptionStatus,
-    pub retries:         u32,
-    pub started_at:      u64,
-}
+A failed charge returns `Ok(Retrying)` or `Ok(Failed)` — never `Err`. Returning
+`Err` from a Soroban contract rolls back the invocation, which would discard the
+retry bookkeeping the failure path exists to record. Reserve `Err` handling for
+genuine caller errors such as `BillingNotDue`.
 
-#[contracttype]
-pub enum SubscriptionStatus {
-    Active,
-    Paused,
-    GracePeriod,
-    Failed,
-    Cancelled,
-}
-```
+### Queries
 
-### Contract Interface
+| Function | Notes |
+|---|---|
+| `get_merchant`, `get_plan`, `get_subscriber`, `get_payment` | Raw record lookups |
+| `get_merchant_plans`, `get_subscriber_plans` | Plan id lists |
+| `get_billing_allowance(subscriber, plan_id)` | Remaining drawable amount; `0` once expired |
+| `is_billable(subscriber, plan_id)` | Whether `process_payment` would attempt a charge now |
 
-```rust
-// Register as a merchant
-fn register_merchant(env: Env, name: Symbol, treasury_wallet: Address) -> Result<(), ContractError>
-
-// Create a billing plan
-fn create_plan(
-    env: Env,
-    merchant_id: Address,
-    name: Symbol,
-    amount: i128,
-    token: Address,
-    interval: u64,
-    grace_period: u64,
-    retry_limit: u32,
-) -> Result<u64, ContractError>
-
-// Subscribe and pay first cycle
-fn subscribe(env: Env, subscriber: Address, plan_id: u64) -> Result<(), ContractError>
-
-// Execute a due billing cycle (permissionless)
-fn process_payment(env: Env, subscriber: Address, plan_id: u64) -> Result<(), ContractError>
-
-// Lifecycle management
-fn pause_subscription(env: Env, subscriber: Address, plan_id: u64) -> Result<(), ContractError>
-fn resume_subscription(env: Env, subscriber: Address, plan_id: u64) -> Result<(), ContractError>
-fn cancel_subscription(env: Env, subscriber: Address, plan_id: u64) -> Result<(), ContractError>
-```
-
-### Payment Execution Flow
-
-```rust
-// From lib.rs — process_payment core logic
-pub fn process_payment(env: Env, subscriber: Address, plan_id: u64) -> Result<(), ContractError> {
-    let mut sub = load_subscriber(&env, &subscriber, plan_id)
-        .ok_or(ContractError::SubscriptionNotFound)?;
-
-    let now = env.ledger().timestamp();
-    if now < sub.next_billing_at {
-        return Err(ContractError::BillingNotDue);
-    }
-
-    match Self::_transfer_payment(&env, &subscriber, &treasury, &plan.token, plan.amount) {
-        Ok(_) => {
-            sub.next_billing_at = now + plan.interval;
-            sub.retries = 0;
-            events::payment_success(&env, &subscriber, plan.amount, now);
-        }
-        Err(_) => {
-            sub.retries += 1;
-            if sub.retries >= plan.retry_limit {
-                sub.status = SubscriptionStatus::Failed;
-                events::payment_failed(&env, &subscriber, plan_id, sub.retries);
-                return Err(ContractError::RetryLimitExceeded);
-            }
-            sub.status = SubscriptionStatus::GracePeriod;
-        }
-    }
-    Ok(())
-}
-```
+Keepers should filter on `is_billable` rather than comparing `next_billing_at`
+themselves — the latter ignores retry throttling and terminal states, and each
+wrong guess costs a transaction fee.
 
 ---
 
-## API Reference
+## Errors
 
-Base URL: `http://localhost:3001/api/v1` · Swagger UI: `http://localhost:3001/docs`
-
-### Merchants
-
-```http
-POST   /merchants                    # Register merchant
-GET    /merchants/:id                # Get merchant profile
-PATCH  /merchants/:id                # Update merchant
-```
-
-### Plans
-
-```http
-POST   /plans                        # Create subscription plan
-GET    /plans?merchantId=<id>        # List plans for merchant
-PATCH  /plans/:id                    # Update plan
-DELETE /plans/:id                    # Disable plan
-```
-
-### Subscriptions
-
-```http
-POST   /subscriptions                # Create subscription
-GET    /subscriptions/:id            # Get subscription details
-PATCH  /subscriptions/:id/pause      # Pause billing
-PATCH  /subscriptions/:id/resume     # Resume billing
-DELETE /subscriptions/:id            # Cancel subscription
-GET    /subscriptions/:id/payments   # Payment history
-```
-
-### Analytics
-
-```http
-GET    /analytics/merchants/:id/stats    # MRR, churn, active count
-GET    /analytics/merchants/:id/revenue  # Revenue time series
-```
-
-### Example: Create a Plan
-
-```bash
-curl -X POST http://localhost:3001/api/v1/plans \
-  -H "Authorization: Bearer <JWT>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "merchantId": "GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
-    "name": "Pro Monthly",
-    "amount": "100000000",
-    "token": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-    "interval": 2592000,
-    "gracePeriod": 86400,
-    "retryLimit": 3
-  }'
-```
+| Code | Error | Meaning |
+|---|---|---|
+| 1–3 | `MerchantNotFound`, `MerchantAlreadyExists`, `MerchantInactive` | |
+| 4–5 | `PlanNotFound`, `PlanInactive` | |
+| 6–8 | `SubscriptionNotFound`, `SubscriptionNotActive`, `SubscriptionAlreadyExists` | |
+| 9 | `BillingNotDue` | Not yet due, or the retry throttle has not elapsed |
+| 10 | `InsufficientBalance` | Subscriber cannot cover the charge |
+| 11 | `RetryLimitExceeded` | Reserved; failures now report via `PaymentOutcome` |
+| 12–14 | `Unauthorized`, `InvalidAmount`, `InvalidInterval` | |
+| 15–17 | `AlreadyPaused`, `NotPaused`, `AlreadyCancelled` | |
+| 18 | `InsufficientAllowance` | Approval too small or expired |
+| 19 | `SubscriptionFailed` | Terminal; resubscribe required |
+| 20 | `InvalidRetryInterval` | `retry_interval` of 0 with retries enabled |
 
 ---
 
-## Webhook Events
+## Events
 
-All webhook payloads are signed with HMAC-SHA256. Verify the `x-webhook-signature` header before processing.
+| Topic | Payload |
+|---|---|
+| `merch_reg` | `()` |
+| `plan_new` | `plan_id` |
+| `sub_new` | `(plan_id, next_billing_at)` |
+| `pay_ok` | `(amount, timestamp)` |
+| `pay_fail` | `(plan_id, retries)` |
+| `retry` | `(plan_id, attempt)` |
+| `sub_pause`, `sub_res`, `sub_canc` | `plan_id` |
 
-```typescript
-// Verify signature
-import { createHmac } from 'crypto';
-
-function verifyWebhook(payload: string, signature: string, secret: string): boolean {
-  const expected = createHmac('sha256', secret)
-    .update(payload)
-    .digest('hex');
-  return expected === signature;
-}
-```
-
-**Event payloads:**
-
-```json
-// Payment succeeded
-{
-  "event": "subscription.payment.success",
-  "subscriptionId": "abc123",
-  "amount": "100000000",
-  "token": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-  "timestamp": 1747339200
-}
-
-// Payment failed (retrying)
-{
-  "event": "subscription.payment.failed",
-  "subscriptionId": "abc123",
-  "retries": 2,
-  "timestamp": 1747339200
-}
-
-// Subscription cancelled
-{
-  "event": "subscription.cancelled",
-  "subscriptionId": "abc123",
-  "timestamp": 1747339200
-}
-```
+All topics are `symbol_short!`, which caps at 9 characters — a limit worth
+remembering, since exceeding it is a compile error rather than a runtime one.
 
 ---
 
-## Getting Started
-
-### Prerequisites
-
-| Tool | Version |
-|------|---------|
-| Node.js | 20+ |
-| pnpm | 10+ |
-| Rust | stable |
-| Docker + Compose | latest |
-| [Stellar CLI](https://developers.stellar.org/docs/tools/developer-tools/cli/install-cli) | latest |
-
-### 1. Clone & Install
+## Development
 
 ```bash
-git clone https://github.com/brite-side0/SS-Billing.git
-cd SS-Billing
-pnpm install
+make test        # cargo test
+make lint        # clippy, warnings denied
+make fmt         # rustfmt
+make check       # everything CI runs
+make build       # compile to wasm32-unknown-unknown
 ```
 
-### 2. Configure Environment
+Requires the [Stellar CLI](https://developers.stellar.org/docs/tools/stellar-cli)
+for `make optimize` and `make deploy`. The toolchain is pinned in
+`rust-toolchain.toml` and dependencies in `Cargo.lock` — both are needed for the
+deployed WASM hash to be reproducible from this source.
+
+### Deploying
 
 ```bash
-cp .env.example .env
+stellar keys generate --global alice --network testnet --fund
+make deploy SOURCE=alice NETWORK=testnet
 ```
 
-```env
-# .env
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/ss_billing
-REDIS_URL=redis://localhost:6379
-
-# Fill these after deploying the contract
-CONTRACT_ID=CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-SIGNER_SECRET=SXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-
-JWT_SECRET=your-jwt-secret
-WEBHOOK_SECRET=your-webhook-secret
-
-STELLAR_NETWORK=testnet
-STELLAR_RPC_URL=https://soroban-testnet.stellar.org
-STELLAR_HORIZON_URL=https://horizon-testnet.stellar.org
-```
-
-### 3. Deploy the Soroban Contract
-
-```bash
-# Install Rust wasm target
-rustup target add wasm32-unknown-unknown
-
-# Build the contract
-cd contracts/subscription-engine
-cargo build --target wasm32-unknown-unknown --release
-
-# Deploy to testnet
-stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/subscription_engine.wasm \
-  --network testnet \
-  --source <YOUR_SECRET_KEY>
-
-# Copy the returned contract ID into your .env CONTRACT_ID
-```
-
-### 4. Start Infrastructure
-
-```bash
-cd infra/docker && docker compose up -d postgres redis
-```
-
-### 5. Run the API
-
-```bash
-pnpm --filter @ss-billing/api dev
-# API available at http://localhost:3001
-# Swagger docs at http://localhost:3001/docs
-```
-
-### 6. Run the Frontend
-
-```bash
-pnpm --filter @ss-billing/web dev
-# App available at http://localhost:3000
-```
-
-### Full Stack (Docker)
-
-```bash
-cd infra/docker && docker compose up
-```
+Pass the resulting contract id to the backend as `CONTRACT_ID`.
 
 ---
 
 ## Testing
 
 ```bash
-# Soroban contract tests
-cd contracts/subscription-engine
-cargo test
-
-# API unit + integration tests
-pnpm --filter @ss-billing/api test
-
-# API test coverage
-pnpm --filter @ss-billing/api test:cov
+cd subscription-engine && cargo test
 ```
 
----
+37 tests covering the state machine, billing schedule, failure handling and
+queries.
 
-## Individual Repositories
+The suite deliberately avoids a blanket `env.mock_all_auths()`. Mocking is
+confined to the fixture, where it substitutes for signatures a user genuinely
+provides. `keeper_can_bill_without_any_authorization` runs under
+`env.set_auths(&[])` — real enforcing mode with an empty authorization set — and
+is the test that actually proves the delegated-billing claim.
 
-This monorepo is also available as standalone repositories:
-
-| Repo | Description |
-|------|-------------|
-| [SS-Billing-Frontend](https://github.com/brite-side0/SS-Billing-frontend) | Next.js 14 merchant & subscriber dashboards |
-| [SS-Billing-Backend](https://github.com/brite-side0/SS-Billing-backend) | NestJS API, scheduler, indexer, webhooks |
-| [SS-Billing-Contract](https://github.com/brite-side0/SS-Billing-contract) | Soroban smart contract (Rust) |
-
----
-
-## Stellar Network
-
-SS-Billing is built exclusively on the **Stellar network** using **Soroban** — Stellar's smart contract platform.
-
-- **Testnet RPC:** `https://soroban-testnet.stellar.org`
-- **Mainnet RPC:** `https://soroban-mainnet.stellar.org`
-- **Explorer:** [stellar.expert](https://stellar.expert)
-- **Token standard:** SEP-41 (compatible with USDC, XLM, and any Stellar asset)
-- **Amounts:** Denominated in stroops — `1 XLM = 10,000,000 stroops`
+Any change to the payment path should be validated against that test
+specifically. Blanket auth mocking will make a broken authorization model look
+perfectly healthy.
 
 ---
 
 ## License
 
-MIT © [brite-side0](https://github.com/brite-side0)
+MIT — see [LICENSE](LICENSE).
