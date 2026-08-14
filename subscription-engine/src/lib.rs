@@ -9,9 +9,7 @@ mod types;
 mod test;
 
 use errors::ContractError;
-use soroban_sdk::{
-    contract, contractimpl, token, Address, Env, Symbol, Vec,
-};
+use soroban_sdk::{contract, contractimpl, token, Address, Env, Symbol, Vec};
 use storage::*;
 use types::*;
 
@@ -55,8 +53,8 @@ impl SubscriptionEngine {
         new_treasury: Address,
     ) -> Result<(), ContractError> {
         merchant_id.require_auth();
-        let mut merchant = load_merchant(&env, &merchant_id)
-            .ok_or(ContractError::MerchantNotFound)?;
+        let mut merchant =
+            load_merchant(&env, &merchant_id).ok_or(ContractError::MerchantNotFound)?;
         merchant.treasury_wallet = new_treasury;
         save_merchant(&env, &merchant);
         Ok(())
@@ -82,8 +80,7 @@ impl SubscriptionEngine {
     ) -> Result<u64, ContractError> {
         merchant_id.require_auth();
 
-        let merchant = load_merchant(&env, &merchant_id)
-            .ok_or(ContractError::MerchantNotFound)?;
+        let merchant = load_merchant(&env, &merchant_id).ok_or(ContractError::MerchantNotFound)?;
         if !merchant.active {
             return Err(ContractError::MerchantInactive);
         }
@@ -157,11 +154,7 @@ impl SubscriptionEngine {
     }
 
     /// Disable a plan (no new subscriptions, existing ones continue until cancelled).
-    pub fn disable_plan(
-        env: Env,
-        merchant_id: Address,
-        plan_id: u64,
-    ) -> Result<(), ContractError> {
+    pub fn disable_plan(env: Env, merchant_id: Address, plan_id: u64) -> Result<(), ContractError> {
         merchant_id.require_auth();
         let mut plan = load_plan(&env, plan_id).ok_or(ContractError::PlanNotFound)?;
         if plan.merchant_id != merchant_id {
@@ -188,11 +181,7 @@ impl SubscriptionEngine {
     /// expiration ledger, so the authorization is "sign once per approval
     /// window", not "sign once, forever" — the subscriber must re-approve
     /// before the window lapses or billing will halt.
-    pub fn subscribe(
-        env: Env,
-        subscriber: Address,
-        plan_id: u64,
-    ) -> Result<(), ContractError> {
+    pub fn subscribe(env: Env, subscriber: Address, plan_id: u64) -> Result<(), ContractError> {
         subscriber.require_auth();
 
         let plan = load_plan(&env, plan_id).ok_or(ContractError::PlanNotFound)?;
@@ -200,8 +189,8 @@ impl SubscriptionEngine {
             return Err(ContractError::PlanInactive);
         }
 
-        let merchant = load_merchant(&env, &plan.merchant_id)
-            .ok_or(ContractError::MerchantNotFound)?;
+        let merchant =
+            load_merchant(&env, &plan.merchant_id).ok_or(ContractError::MerchantNotFound)?;
         if !merchant.active {
             return Err(ContractError::MerchantInactive);
         }
@@ -213,17 +202,26 @@ impl SubscriptionEngine {
         let now = env.ledger().timestamp();
         // Charge the first cycle immediately. This also proves the allowance
         // is in place, so we never create a subscription that cannot be billed.
-        Self::_charge(&env, &subscriber, &merchant.treasury_wallet, &plan.token, plan.amount)?;
+        Self::_charge(
+            &env,
+            &subscriber,
+            &merchant.treasury_wallet,
+            &plan.token,
+            plan.amount,
+        )?;
 
         let record_id = next_payment_id(&env);
-        save_payment(&env, &PaymentRecord {
-            payment_id: record_id,
-            subscriber: subscriber.clone(),
-            merchant: plan.merchant_id.clone(),
-            amount: plan.amount,
-            timestamp: now,
-            success: true,
-        });
+        save_payment(
+            &env,
+            &PaymentRecord {
+                payment_id: record_id,
+                subscriber: subscriber.clone(),
+                merchant: plan.merchant_id.clone(),
+                amount: plan.amount,
+                timestamp: now,
+                success: true,
+            },
+        );
 
         let next_billing_at = now.saturating_add(plan.interval);
         let sub = Subscriber {
@@ -269,8 +267,8 @@ impl SubscriptionEngine {
 
         let now = env.ledger().timestamp();
         let plan = load_plan(&env, plan_id).ok_or(ContractError::PlanNotFound)?;
-        let merchant = load_merchant(&env, &plan.merchant_id)
-            .ok_or(ContractError::MerchantNotFound)?;
+        let merchant =
+            load_merchant(&env, &plan.merchant_id).ok_or(ContractError::MerchantNotFound)?;
 
         // A disabled plan or deactivated merchant stops collecting. Existing
         // subscriptions are left untouched so they can be cancelled cleanly.
@@ -301,14 +299,17 @@ impl SubscriptionEngine {
         ) {
             Ok(()) => {
                 let record_id = next_payment_id(&env);
-                save_payment(&env, &PaymentRecord {
-                    payment_id: record_id,
-                    subscriber: subscriber.clone(),
-                    merchant: plan.merchant_id.clone(),
-                    amount: plan.amount,
-                    timestamp: now,
-                    success: true,
-                });
+                save_payment(
+                    &env,
+                    &PaymentRecord {
+                        payment_id: record_id,
+                        subscriber: subscriber.clone(),
+                        merchant: plan.merchant_id.clone(),
+                        amount: plan.amount,
+                        timestamp: now,
+                        success: true,
+                    },
+                );
 
                 // Advance from the previous anchor, not from `now`, so a keeper
                 // that runs late does not permanently shift the billing date.
@@ -332,14 +333,17 @@ impl SubscriptionEngine {
                 events::retry_attempted(&env, &subscriber, plan_id, sub.retries);
 
                 let record_id = next_payment_id(&env);
-                save_payment(&env, &PaymentRecord {
-                    payment_id: record_id,
-                    subscriber: subscriber.clone(),
-                    merchant: plan.merchant_id.clone(),
-                    amount: plan.amount,
-                    timestamp: now,
-                    success: false,
-                });
+                save_payment(
+                    &env,
+                    &PaymentRecord {
+                        payment_id: record_id,
+                        subscriber: subscriber.clone(),
+                        merchant: plan.merchant_id.clone(),
+                        amount: plan.amount,
+                        timestamp: now,
+                        success: false,
+                    },
+                );
 
                 // The subscription dies when either budget runs out: the retry
                 // count or the grace window. Checking only retries would let a

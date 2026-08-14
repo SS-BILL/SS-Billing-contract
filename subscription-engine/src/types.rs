@@ -49,7 +49,7 @@ pub struct SubscriptionPlan {
     pub name: Symbol,
     pub amount: i128,
     pub token: Address,
-    pub interval: u64,   // seconds between billing cycles
+    pub interval: u64, // seconds between billing cycles
     pub grace_period: u64,
     pub retry_limit: u32,
     /// Seconds to wait between retry attempts after a failed charge. Without

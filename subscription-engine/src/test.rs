@@ -37,8 +37,12 @@ impl Ctx {
     /// Grant the contract an allowance to draw from the subscriber. This is the
     /// one-time authorization the whole delegated-billing model rests on.
     fn approve(&self, amount: i128, expiration_ledger: u32) {
-        self.token_client()
-            .approve(&self.subscriber, &self.contract_id, &amount, &expiration_ledger);
+        self.token_client().approve(
+            &self.subscriber,
+            &self.contract_id,
+            &amount,
+            &expiration_ledger,
+        );
     }
 
     /// Move the ledger forward in both time and sequence.
@@ -67,7 +71,9 @@ impl Ctx {
     }
 
     fn subscription(&self, plan_id: u64) -> crate::types::Subscriber {
-        self.client.get_subscriber(&self.subscriber, &plan_id).unwrap()
+        self.client
+            .get_subscriber(&self.subscriber, &plan_id)
+            .unwrap()
     }
 }
 
@@ -160,7 +166,10 @@ fn updates_treasury() {
     let new_treasury = Address::generate(&ctx.env);
     ctx.client.update_treasury(&ctx.merchant, &new_treasury);
     assert_eq!(
-        ctx.client.get_merchant(&ctx.merchant).unwrap().treasury_wallet,
+        ctx.client
+            .get_merchant(&ctx.merchant)
+            .unwrap()
+            .treasury_wallet,
         new_treasury
     );
 }
@@ -264,7 +273,9 @@ fn subscribe_fails_without_an_allowance() {
     let result = ctx.client.try_subscribe(&ctx.subscriber, &plan_id);
     assert_eq!(result, Err(Ok(ContractError::InsufficientAllowance)));
     assert!(
-        ctx.client.get_subscriber(&ctx.subscriber, &plan_id).is_none(),
+        ctx.client
+            .get_subscriber(&ctx.subscriber, &plan_id)
+            .is_none(),
         "no subscription should exist when the first charge fails"
     );
 }
@@ -421,7 +432,10 @@ fn allowance_expiry_stops_billing() {
 
     ctx.warp(INTERVAL + 1, 1_001); // past the approval's expiration ledger
 
-    assert_eq!(ctx.client.get_billing_allowance(&ctx.subscriber, &plan_id), 0);
+    assert_eq!(
+        ctx.client.get_billing_allowance(&ctx.subscriber, &plan_id),
+        0
+    );
     assert_eq!(
         ctx.client.process_payment(&ctx.subscriber, &plan_id),
         PaymentOutcome::Retrying
@@ -576,7 +590,9 @@ fn pause_and_resume_does_not_skip_a_billing_cycle() {
 fn resume_requires_a_paused_subscription() {
     let ctx = setup();
     let plan_id = subscribed(&ctx);
-    let result = ctx.client.try_resume_subscription(&ctx.subscriber, &plan_id);
+    let result = ctx
+        .client
+        .try_resume_subscription(&ctx.subscriber, &plan_id);
     assert_eq!(result, Err(Ok(ContractError::NotPaused)));
 }
 
@@ -590,7 +606,9 @@ fn cancels_subscription_once() {
         SubscriptionStatus::Cancelled
     );
 
-    let result = ctx.client.try_cancel_subscription(&ctx.subscriber, &plan_id);
+    let result = ctx
+        .client
+        .try_cancel_subscription(&ctx.subscriber, &plan_id);
     assert_eq!(result, Err(Ok(ContractError::AlreadyCancelled)));
 }
 
