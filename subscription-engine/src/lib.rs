@@ -65,6 +65,10 @@ impl SubscriptionEngine {
     // ── Plan Functions ────────────────────────────────────────────────────────
 
     /// Create a subscription plan under a merchant.
+    // Soroban entry points keep flat argument lists: a struct parameter would
+    // force every client to construct a matching ScVal map, so the ABI stays
+    // positional even where clippy would prefer a config struct.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_plan(
         env: Env,
         merchant_id: Address,
@@ -115,6 +119,10 @@ impl SubscriptionEngine {
     }
 
     /// Update mutable plan fields (amount, interval, grace_period, retry_limit).
+    // Soroban entry points keep flat argument lists: a struct parameter would
+    // force every client to construct a matching ScVal map, so the ABI stays
+    // positional even where clippy would prefer a config struct.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_plan(
         env: Env,
         merchant_id: Address,
