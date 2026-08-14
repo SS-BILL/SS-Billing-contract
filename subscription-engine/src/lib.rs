@@ -28,9 +28,8 @@ impl SubscriptionEngine {
         name: Symbol,
         treasury_wallet: Address,
     ) -> Result<(), ContractError> {
-        let merchant_id = env.current_contract_address();
-        // In practice the invoker is the merchant; require their auth
-        // We use the treasury_wallet as the authenticated merchant identity
+        // The treasury wallet doubles as the merchant's identity, so it must
+        // prove control of the address it wants funds routed to.
         treasury_wallet.require_auth();
 
         if load_merchant(&env, &treasury_wallet).is_some() {
@@ -75,6 +74,7 @@ impl SubscriptionEngine {
         interval: u64,
         grace_period: u64,
         retry_limit: u32,
+        retry_interval: u64,
     ) -> Result<u64, ContractError> {
         merchant_id.require_auth();
 
@@ -89,6 +89,11 @@ impl SubscriptionEngine {
         if interval == 0 {
             return Err(ContractError::InvalidInterval);
         }
+        // A zero retry interval would let a keeper drain the retry budget in
+        // consecutive ledgers, so require one whenever retries are enabled.
+        if retry_limit > 0 && retry_interval == 0 {
+            return Err(ContractError::InvalidRetryInterval);
+        }
 
         let plan_id = next_plan_id(&env);
         let plan = SubscriptionPlan {
@@ -100,6 +105,7 @@ impl SubscriptionEngine {
             interval,
             grace_period,
             retry_limit,
+            retry_interval,
             active: true,
         };
         save_plan(&env, &plan);
@@ -117,6 +123,7 @@ impl SubscriptionEngine {
         interval: u64,
         grace_period: u64,
         retry_limit: u32,
+        retry_interval: u64,
     ) -> Result<(), ContractError> {
         merchant_id.require_auth();
         let mut plan = load_plan(&env, plan_id).ok_or(ContractError::PlanNotFound)?;
@@ -129,10 +136,14 @@ impl SubscriptionEngine {
         if interval == 0 {
             return Err(ContractError::InvalidInterval);
         }
+        if retry_limit > 0 && retry_interval == 0 {
+            return Err(ContractError::InvalidRetryInterval);
+        }
         plan.amount = amount;
         plan.interval = interval;
         plan.grace_period = grace_period;
         plan.retry_limit = retry_limit;
+        plan.retry_interval = retry_interval;
         save_plan(&env, &plan);
         Ok(())
     }
@@ -155,7 +166,20 @@ impl SubscriptionEngine {
 
     // ── Subscription Functions ────────────────────────────────────────────────
 
-    /// Subscribe to a plan. Subscriber authorizes once; billing is delegated.
+    /// Subscribe to a plan and pay the first cycle immediately.
+    ///
+    /// Before calling this, the subscriber must grant the contract a token
+    /// allowance:
+    ///
+    /// ```text
+    /// token.approve(subscriber, <this contract>, total_budget, expiration_ledger)
+    /// ```
+    ///
+    /// That approval is what lets later cycles be charged without the
+    /// subscriber signing again. Note that Stellar allowances carry an
+    /// expiration ledger, so the authorization is "sign once per approval
+    /// window", not "sign once, forever" — the subscriber must re-approve
+    /// before the window lapses or billing will halt.
     pub fn subscribe(
         env: Env,
         subscriber: Address,
@@ -179,8 +203,9 @@ impl SubscriptionEngine {
         }
 
         let now = env.ledger().timestamp();
-        // Charge first payment immediately
-        Self::_transfer_payment(&env, &subscriber, &merchant.treasury_wallet, &plan.token, plan.amount)?;
+        // Charge the first cycle immediately. This also proves the allowance
+        // is in place, so we never create a subscription that cannot be billed.
+        Self::_charge(&env, &subscriber, &merchant.treasury_wallet, &plan.token, plan.amount)?;
 
         let record_id = next_payment_id(&env);
         save_payment(&env, &PaymentRecord {
@@ -192,11 +217,12 @@ impl SubscriptionEngine {
             success: true,
         });
 
-        let next_billing_at = now + plan.interval;
+        let next_billing_at = now.saturating_add(plan.interval);
         let sub = Subscriber {
             subscriber: subscriber.clone(),
             plan_id,
             next_billing_at,
+            next_retry_at: 0,
             status: SubscriptionStatus::Active,
             retries: 0,
             started_at: now,
@@ -208,19 +234,29 @@ impl SubscriptionEngine {
         Ok(())
     }
 
-    /// Process a recurring billing cycle. Can be called by anyone (scheduler/keeper).
+    /// Process a recurring billing cycle.
+    ///
+    /// Callable by anyone — a keeper, the merchant, or the subscriber — because
+    /// the funds move under the allowance the subscriber granted at signup, not
+    /// under the caller's authority. No signature from the subscriber is needed
+    /// or accepted here.
+    ///
+    /// A failed charge is reported as `Ok(PaymentOutcome::Retrying | Failed)`,
+    /// never as `Err`. Returning `Err` would roll back the invocation, discarding
+    /// the very retry bookkeeping the failure path exists to record.
     pub fn process_payment(
         env: Env,
         subscriber: Address,
         plan_id: u64,
-    ) -> Result<(), ContractError> {
+    ) -> Result<PaymentOutcome, ContractError> {
         let mut sub = load_subscriber(&env, &subscriber, plan_id)
             .ok_or(ContractError::SubscriptionNotFound)?;
 
         match sub.status {
             SubscriptionStatus::Cancelled => return Err(ContractError::AlreadyCancelled),
             SubscriptionStatus::Paused => return Err(ContractError::SubscriptionNotActive),
-            _ => {}
+            SubscriptionStatus::Failed => return Err(ContractError::SubscriptionFailed),
+            SubscriptionStatus::Active | SubscriptionStatus::GracePeriod => {}
         }
 
         let now = env.ledger().timestamp();
@@ -228,16 +264,34 @@ impl SubscriptionEngine {
         let merchant = load_merchant(&env, &plan.merchant_id)
             .ok_or(ContractError::MerchantNotFound)?;
 
-        // Billing not yet due (allow grace period window)
+        // A disabled plan or deactivated merchant stops collecting. Existing
+        // subscriptions are left untouched so they can be cancelled cleanly.
+        if !plan.active {
+            return Err(ContractError::PlanInactive);
+        }
+        if !merchant.active {
+            return Err(ContractError::MerchantInactive);
+        }
+
         if now < sub.next_billing_at {
             return Err(ContractError::BillingNotDue);
         }
+        // While retrying, throttle to the plan's retry interval so a keeper
+        // polling every ledger cannot exhaust the retry budget instantly.
+        if sub.status == SubscriptionStatus::GracePeriod && now < sub.next_retry_at {
+            return Err(ContractError::BillingNotDue);
+        }
 
-        // Check if in grace period
-        let in_grace = now > sub.next_billing_at + plan.grace_period;
+        let grace_deadline = sub.next_billing_at.saturating_add(plan.grace_period);
 
-        match Self::_transfer_payment(&env, &subscriber, &merchant.treasury_wallet, &plan.token, plan.amount) {
-            Ok(_) => {
+        match Self::_charge(
+            &env,
+            &subscriber,
+            &merchant.treasury_wallet,
+            &plan.token,
+            plan.amount,
+        ) {
+            Ok(()) => {
                 let record_id = next_payment_id(&env);
                 save_payment(&env, &PaymentRecord {
                     payment_id: record_id,
@@ -247,39 +301,60 @@ impl SubscriptionEngine {
                     timestamp: now,
                     success: true,
                 });
-                sub.next_billing_at = now + plan.interval;
+
+                // Advance from the previous anchor, not from `now`, so a keeper
+                // that runs late does not permanently shift the billing date.
+                // If the anchor has fallen too far behind to catch up, reset it
+                // to `now` rather than emitting a due date in the past.
+                let anchored = sub.next_billing_at.saturating_add(plan.interval);
+                sub.next_billing_at = if anchored <= now {
+                    now.saturating_add(plan.interval)
+                } else {
+                    anchored
+                };
+                sub.next_retry_at = 0;
                 sub.retries = 0;
                 sub.status = SubscriptionStatus::Active;
                 save_subscriber(&env, &sub);
                 events::payment_success(&env, &subscriber, plan.amount, now);
+                Ok(PaymentOutcome::Paid)
             }
             Err(_) => {
-                sub.retries += 1;
+                sub.retries = sub.retries.saturating_add(1);
                 events::retry_attempted(&env, &subscriber, plan_id, sub.retries);
 
-                if sub.retries >= plan.retry_limit {
+                let record_id = next_payment_id(&env);
+                save_payment(&env, &PaymentRecord {
+                    payment_id: record_id,
+                    subscriber: subscriber.clone(),
+                    merchant: plan.merchant_id.clone(),
+                    amount: plan.amount,
+                    timestamp: now,
+                    success: false,
+                });
+
+                // The subscription dies when either budget runs out: the retry
+                // count or the grace window. Checking only retries would let a
+                // long retry_interval keep a delinquent subscription alive
+                // indefinitely past its grace deadline.
+                let retries_exhausted = sub.retries >= plan.retry_limit;
+                let grace_exhausted = now >= grace_deadline;
+
+                if retries_exhausted || grace_exhausted {
                     sub.status = SubscriptionStatus::Failed;
+                    sub.next_retry_at = 0;
                     save_subscriber(&env, &sub);
-                    let record_id = next_payment_id(&env);
-                    save_payment(&env, &PaymentRecord {
-                        payment_id: record_id,
-                        subscriber: subscriber.clone(),
-                        merchant: plan.merchant_id.clone(),
-                        amount: plan.amount,
-                        timestamp: now,
-                        success: false,
-                    });
                     events::payment_failed(&env, &subscriber, plan_id, sub.retries);
-                    return Err(ContractError::RetryLimitExceeded);
+                    Ok(PaymentOutcome::Failed)
                 } else {
                     sub.status = SubscriptionStatus::GracePeriod;
+                    sub.next_retry_at = now.saturating_add(plan.retry_interval);
                     save_subscriber(&env, &sub);
                     events::payment_failed(&env, &subscriber, plan_id, sub.retries);
-                    return Err(ContractError::InsufficientBalance);
+                    Ok(PaymentOutcome::Retrying)
                 }
             }
         }
-        Ok(())
     }
 
     /// Pause an active subscription.
@@ -370,7 +445,23 @@ impl SubscriptionEngine {
 
     // ── Internal Helpers ──────────────────────────────────────────────────────
 
-    fn _transfer_payment(
+    /// Move `amount` from the subscriber to the merchant treasury using the
+    /// allowance the subscriber granted this contract.
+    ///
+    /// `transfer_from` requires auth from the *spender*, which is this contract.
+    /// A contract's own address is authorized automatically for sub-invocations
+    /// it makes directly, so no signature is needed at call time — that is what
+    /// makes keeper-driven billing possible.
+    ///
+    /// The previous implementation called `transfer(from = subscriber, ..)`,
+    /// which requires auth from the subscriber and therefore could only ever
+    /// succeed inside a transaction the subscriber personally signed. That
+    /// contradicted the entire delegated-billing design.
+    ///
+    /// Both preconditions are checked before dispatching, because a trapped
+    /// token call would abort the whole invocation and lose the retry
+    /// bookkeeping the caller needs to persist.
+    fn _charge(
         env: &Env,
         from: &Address,
         to: &Address,
@@ -378,11 +469,17 @@ impl SubscriptionEngine {
         amount: i128,
     ) -> Result<(), ContractError> {
         let client = token::Client::new(env, token);
-        let balance = client.balance(from);
-        if balance < amount {
+        let spender = env.current_contract_address();
+
+        if client.balance(from) < amount {
             return Err(ContractError::InsufficientBalance);
         }
-        client.transfer(from, to, &amount);
+        // Returns 0 once the approval's expiration ledger has passed.
+        if client.allowance(from, &spender) < amount {
+            return Err(ContractError::InsufficientAllowance);
+        }
+
+        client.transfer_from(&spender, from, to, &amount);
         Ok(())
     }
 }
