@@ -445,6 +445,45 @@ impl SubscriptionEngine {
         storage::get_subscriber_plans(&env, &subscriber)
     }
 
+    /// Remaining allowance this contract may draw from `subscriber` for `plan_id`.
+    ///
+    /// Front-ends should surface this: it is the number the subscriber must top
+    /// up before their allowance lapses and billing silently stops. Returns 0
+    /// once the approval has expired.
+    pub fn get_billing_allowance(
+        env: Env,
+        subscriber: Address,
+        plan_id: u64,
+    ) -> Result<i128, ContractError> {
+        let plan = load_plan(&env, plan_id).ok_or(ContractError::PlanNotFound)?;
+        let client = token::Client::new(&env, &plan.token);
+        Ok(client.allowance(&subscriber, &env.current_contract_address()))
+    }
+
+    /// Whether `process_payment` would attempt a charge right now.
+    ///
+    /// Keepers should filter on this instead of guessing from `next_billing_at`,
+    /// which does not account for retry throttling or terminal states.
+    pub fn is_billable(env: Env, subscriber: Address, plan_id: u64) -> bool {
+        let Some(sub) = load_subscriber(&env, &subscriber, plan_id) else {
+            return false;
+        };
+        let Some(plan) = load_plan(&env, plan_id) else {
+            return false;
+        };
+        if !plan.active {
+            return false;
+        }
+        let now = env.ledger().timestamp();
+        match sub.status {
+            SubscriptionStatus::Active => now >= sub.next_billing_at,
+            SubscriptionStatus::GracePeriod => {
+                now >= sub.next_billing_at && now >= sub.next_retry_at
+            }
+            _ => false,
+        }
+    }
+
     // ── Internal Helpers ──────────────────────────────────────────────────────
 
     /// Move `amount` from the subscriber to the merchant treasury using the
