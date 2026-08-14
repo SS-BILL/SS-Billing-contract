@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, Env, Symbol, symbol_short};
+use soroban_sdk::{Address, Env, symbol_short};
 
 pub fn merchant_registered(env: &Env, merchant: &Address) {
     env.events().publish((symbol_short!("merch_reg"), merchant.clone()), ());
