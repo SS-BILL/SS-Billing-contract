@@ -390,9 +390,11 @@ impl SubscriptionEngine {
         if sub.status != SubscriptionStatus::Paused {
             return Err(ContractError::NotPaused);
         }
-        // Reset next billing to now + interval on resume
-        sub.next_billing_at = env.ledger().timestamp() + load_plan(&env, plan_id)
-            .ok_or(ContractError::PlanNotFound)?.interval;
+        // The billing anchor is deliberately left untouched. Resetting it to
+        // `now + interval` let a subscriber pause on day 29 and resume on day
+        // 30 to receive an unbounded free ride. If the anchor is already in the
+        // past on resume, the subscription is immediately billable — which is
+        // the correct outcome for service consumed during the pause.
         sub.status = SubscriptionStatus::Active;
         save_subscriber(&env, &sub);
         events::subscription_resumed(&env, &subscriber, plan_id);
