@@ -20,4 +20,11 @@ pub enum ContractError {
     AlreadyPaused = 15,
     NotPaused = 16,
     AlreadyCancelled = 17,
+    /// The subscriber has not granted this contract a large enough token
+    /// allowance, or the allowance has passed its expiration ledger.
+    InsufficientAllowance = 18,
+    /// The subscription exhausted its retry budget or grace window and can
+    /// only be revived by resubscribing.
+    SubscriptionFailed = 19,
+    InvalidRetryInterval = 20,
 }

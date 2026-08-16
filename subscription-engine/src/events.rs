@@ -1,16 +1,18 @@
-use soroban_sdk::{Address, Env, Symbol, symbol_short};
+use soroban_sdk::{symbol_short, Address, Env};
 
 pub fn merchant_registered(env: &Env, merchant: &Address) {
-    env.events().publish((symbol_short!("merch_reg"), merchant.clone()), ());
+    env.events()
+        .publish((symbol_short!("merch_reg"), merchant.clone()), ());
 }
 
 pub fn plan_created(env: &Env, merchant: &Address, plan_id: u64) {
-    env.events().publish((symbol_short!("plan_new"), merchant.clone()), plan_id);
+    env.events()
+        .publish((symbol_short!("plan_new"), merchant.clone()), plan_id);
 }
 
 pub fn subscribed(env: &Env, subscriber: &Address, plan_id: u64, next_billing: u64) {
     env.events().publish(
-        (symbol_short!("subscribed"), subscriber.clone()),
+        (symbol_short!("sub_new"), subscriber.clone()),
         (plan_id, next_billing),
     );
 }
@@ -30,15 +32,18 @@ pub fn payment_failed(env: &Env, subscriber: &Address, plan_id: u64, retries: u3
 }
 
 pub fn subscription_paused(env: &Env, subscriber: &Address, plan_id: u64) {
-    env.events().publish((symbol_short!("sub_pause"), subscriber.clone()), plan_id);
+    env.events()
+        .publish((symbol_short!("sub_pause"), subscriber.clone()), plan_id);
 }
 
 pub fn subscription_resumed(env: &Env, subscriber: &Address, plan_id: u64) {
-    env.events().publish((symbol_short!("sub_resume"), subscriber.clone()), plan_id);
+    env.events()
+        .publish((symbol_short!("sub_res"), subscriber.clone()), plan_id);
 }
 
 pub fn subscription_cancelled(env: &Env, subscriber: &Address, plan_id: u64) {
-    env.events().publish((symbol_short!("sub_cancel"), subscriber.clone()), plan_id);
+    env.events()
+        .publish((symbol_short!("sub_canc"), subscriber.clone()), plan_id);
 }
 
 pub fn retry_attempted(env: &Env, subscriber: &Address, plan_id: u64, attempt: u32) {
